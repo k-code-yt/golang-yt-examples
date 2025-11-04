@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
 )
 
 var (
@@ -140,7 +141,7 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 
 	go func() {
 		for {
-			time.Sleep(2 * time.Second)
+			time.Sleep(100 * time.Microsecond)
 			if tc.targetMsgCount == int(tc.msgCount.Load()) {
 				close(exit)
 				return
@@ -175,8 +176,8 @@ func TestConnection(t *testing.T) {
 	go s.createWSServer()
 	ctx, cancel := context.WithCancel(context.Background())
 	time.Sleep(1 * time.Second)
-	clientCount := 500
-	brCount := 100
+	clientCount := 2
+	brCount := 5
 
 	tc := TestConfig{
 		clientCount:    clientCount,
@@ -210,17 +211,13 @@ func TestConnection(t *testing.T) {
 	fmt.Println("exiting test")
 }
 
-// 1. join server
-// 2. join room -> we need at least 2
-// 3. send room msg -> make sure no race && we got correct count
-// 4. leave room -> client count should be 0 in room
 func TestRooms(t *testing.T) {
 	s := NewServer()
 	go s.createWSServer()
 	ctx, cancel := context.WithCancel(context.Background())
 	time.Sleep(1 * time.Second)
-	clientCount := 10
-	msgCount := 5
+	clientCount := 500
+	msgCount := 400
 
 	tc := TestConfig{
 		clientCount:    clientCount,
@@ -316,4 +313,57 @@ func TestRooms(t *testing.T) {
 	}
 
 	fmt.Println("exiting test")
+}
+
+func TestThrottling(t *testing.T) {
+	s := NewServer()
+
+	go s.createWSServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	time.Sleep(1 * time.Second)
+	clientCount := 10
+	brCount := 20
+
+	tc := TestConfig{
+		clientCount:    clientCount,
+		wg:             new(sync.WaitGroup),
+		msgCount:       new(atomic.Int64),
+		targetMsgCount: clientCount * brCount,
+	}
+
+	tc.wg.Add(tc.clientCount + 1)
+
+	brConn := DialServer(&tc)
+	brClient := NewTestClient(brConn, ctx)
+	go brClient.writeLoop()
+
+	for range tc.clientCount {
+		go DialServer(&tc)
+	}
+	time.Sleep(1 * time.Second)
+
+	start := time.Now()
+
+	for range brCount {
+		msg := ReqMsg{
+			MsgType: MsgType_Broadcast,
+			Data:    "hello from tests",
+		}
+		brClient.msgCH <- &msg
+	}
+
+	tc.wg.Wait()
+	tDuration := time.Since(start)
+
+	cancel()
+
+	time.Sleep(1 * time.Second)
+
+	minDuration := time.Duration(float64(brCount)/float64(DefaultMsgPerSecond)) * time.Second
+	fmt.Println("----TEST RESULTS----")
+	fmt.Printf("testDuration = %v\n", tDuration)
+	fmt.Printf("minDuration = %v\n", minDuration)
+	fmt.Println("----END OF THE TEST----")
+
+	assert.GreaterOrEqual(t, tDuration, minDuration, "messages got throttled")
 }

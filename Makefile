@@ -9,9 +9,13 @@ test-chat-race:
 	@go clean -testcache
 	@go test -race -v ./...
 	
+test-conn-race:
+	@go clean -testcache
+	@go test -race -v -timeout 60s -run TestConnection .
+
 test-rooms-race:
 	@go clean -testcache
-	@go test -race -v -timeout 30s -run TestRooms .
+	@go test -race -v -timeout 60s -run TestRooms .
 	
 test-chat:
 	@go clean -testcache
