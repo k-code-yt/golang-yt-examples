@@ -1,18 +1,11 @@
-build-chat:
-	@go build -o ./bin/chat ./...
-	@chmod +x ./bin/chat
+build-app:
+	@go build -o ./bin/app ./...
+	@chmod +x ./bin/app
 
-chat: build-chat
-	@./bin/chat
+app: build-app
+	@./bin/app
 
-test-chat-race:
+test-app-race:
 	@go clean -testcache
 	@go test -race -v ./...
 	
-test-rooms-race:
-	@go clean -testcache
-	@go test -race -v -timeout 30s -run TestRooms .
-	
-test-chat:
-	@go clean -testcache
-	@go test -v ./...
