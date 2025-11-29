@@ -5,6 +5,7 @@ import (
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/k-code-yt/golang-yt-examples/internal/shared"
+	"github.com/sirupsen/logrus"
 )
 
 type KafkaProducer struct {
@@ -12,12 +13,10 @@ type KafkaProducer struct {
 	topic    string
 }
 
-func NewKafkaProducer(topic string) *KafkaProducer {
+func NewKafkaProducer() *KafkaProducer {
 	cfg := shared.NewKafkaConfig()
 
-	if topic == "" {
-		topic = cfg.Topic
-	}
+	topic := cfg.DefaultTopic
 	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": cfg.Host})
 	if err != nil {
 		panic(err)
@@ -30,7 +29,10 @@ func NewKafkaProducer(topic string) *KafkaProducer {
 				if ev.TopicPartition.Error != nil {
 					fmt.Printf("Delivery failed: %v\n", ev.TopicPartition)
 				} else {
-					fmt.Printf("Delivered message to %v\n", ev.TopicPartition)
+					logrus.WithFields(logrus.Fields{
+						"PRTN":   ev.TopicPartition.Partition,
+						"OFFSET": ev.TopicPartition.Offset,
+					}).Info("Delivered message")
 				}
 			}
 		}
@@ -43,11 +45,11 @@ func NewKafkaProducer(topic string) *KafkaProducer {
 }
 
 func (p *KafkaProducer) Produce(msg []byte) {
-	err := p.producer.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny},
+	cfg := shared.NewKafkaConfig()
+	topic := cfg.DefaultTopic
+	p.producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
 		Value:          msg,
 	}, nil)
-	if err != nil {
-		fmt.Printf("error producing msg := %v\n", err)
-	}
+
 }

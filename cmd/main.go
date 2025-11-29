@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -16,82 +18,100 @@ import (
 )
 
 type Server struct {
+	addr      string
 	producer  *producer.KafkaProducer
 	consumer  *consumer.KafkaConsumer
-	msgCH     chan *shared.Message
 	eventRepo *repo.EventRepo
+	msgCH     chan *shared.Message
 }
 
-func NewServer(eventRepo *repo.EventRepo) *Server {
-	msgCH := make(chan *shared.Message, 64)
-	c, err := consumer.NewKafkaConsumer(msgCH)
-	if err != nil {
-		panic(err)
-	}
+func NewServer(addr string, eventRepo *repo.EventRepo) *Server {
 	return &Server{
-		producer:  producer.NewKafkaProducer(""),
-		consumer:  c,
-		msgCH:     msgCH,
+		msgCH:     make(chan *shared.Message, 512),
+		addr:      addr,
 		eventRepo: eventRepo,
 	}
 }
 
-func (s *Server) produceMsg() {
-	ticker := time.NewTicker(time.Second * 5)
-	defer ticker.Stop()
-	for range ticker.C {
-		msg := repo.NewEvent()
-		b, err := json.Marshal(msg)
+func (s *Server) addProducer() *Server {
+	shouldProduce := os.Getenv("SHOULD_PRODUCE") == "true"
+	if !shouldProduce {
+		shouldProduce = *flag.Bool("SHOULD_PRODUCE", false, "Enable message production")
+		flag.Parse()
+	}
+	fmt.Printf("SHOULD_PRODUCE = %t\n", shouldProduce)
+
+	if shouldProduce {
+		s.producer = producer.NewKafkaProducer()
+		go s.produceMsgs()
+	}
+	return s
+}
+
+func (s *Server) addConsumer() *Server {
+	c := consumer.NewKafkaConsumer(s.msgCH)
+	s.consumer = c
+	return s
+}
+
+func (s *Server) handleMsg(msg *shared.Message) {
+	<-s.consumer.ReadyCH
+	r := time.Duration(rand.IntN(5))
+	time.Sleep(r * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+	_, err := s.saveToDB(ctx, msg)
+	if err != nil {
+		return
+	}
+}
+
+func (s *Server) saveToDB(ctx context.Context, msg *shared.Message) (string, error) {
+	return repo.TxClosure(ctx, s.eventRepo, func(ctx context.Context, tx *sqlx.Tx) (string, error) {
+		id, err := s.eventRepo.Insert(ctx, tx, msg.Event)
 		if err != nil {
-			panic("unable to marshal json")
+			exists := repo.IsDuplicateKeyErr(err)
+			if exists {
+				eMsg := fmt.Sprintf("already exists OFFSET = %d, PRTN = %d, EventID = %s\n", msg.Metadata.Offset, msg.Metadata.Partition, msg.Event.EventId)
+				s.consumer.UpdateState(msg.Metadata, consumer.MsgState_Success)
+				return "", errors.New(eMsg)
+			}
+			s.consumer.UpdateState(msg.Metadata, consumer.MsgState_Error)
+			return "", err
+		}
+		s.consumer.UpdateState(msg.Metadata, consumer.MsgState_Success)
+		return id, nil
+	})
+}
+
+func (s *Server) produceMsgs() {
+	ticker := time.NewTicker(2 * time.Second)
+	for range ticker.C {
+		event := repo.NewEvent()
+		b, err := json.Marshal(event)
+		if err != nil {
+			fmt.Printf("err marshaling event = %v\n", err)
+			continue
 		}
 		s.producer.Produce(b)
 	}
 }
 
-func (s *Server) handleMsg(msg *shared.Message) {
-	ctx := context.Background()
-	rand := rand.IntN(5)
-	time.Sleep(time.Duration(rand + 1))
-	_, err := s.saveToDB(ctx, msg)
-	if err != nil {
-		fmt.Println("db err = %v\n", err)
-	}
-}
-
-// 1. do we need to get -> NO
-// 2. do we lock db, higher isolation level -> NO
-// 3. ctx + tx -> YES
-func (s *Server) saveToDB(ctx context.Context, msg *shared.Message) (string, error) {
-	return repo.TxClosure(ctx, s.eventRepo, func(ctx context.Context, tx *sqlx.Tx) (string, error) {
-		fmt.Printf("starting DB operation for OFFSET = %d, EventID = %s\n", msg.Metadata.Offset, msg.Event.EventId)
-		// TODO -> how to handle insert error
-		defer s.consumer.MarkAsComplete(msg.Metadata)
-		// business logic
-		event := s.eventRepo.Get(ctx, tx, msg.Event.EventId)
-		if event != nil {
-			eMsg := fmt.Sprintf("offset = %d, eventID %s already existing -> skipping\n", msg.Metadata.Offset, msg.Event.EventId)
-			return "", errors.New(eMsg)
-		}
-
-		id, err := s.eventRepo.Insert(ctx, tx, msg.Event)
-		if err != nil {
-			return "", err
-		}
-		fmt.Printf("INSERT SUCCESS, EventID = %s, Offset = %d\n", id, msg.Metadata.Offset)
-		return id, nil
-	})
-}
-
 func main() {
 	db, err := repo.NewDBConn()
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("unable to conn to db, err = %v\n", err))
 	}
+	defer db.Close()
+
 	er := repo.NewEventRepo(db)
-	s := NewServer(er)
-	go s.produceMsg()
-	for msg := range s.msgCH {
-		go s.handleMsg(msg)
-	}
+	s := NewServer(":7576", er).addConsumer().addProducer()
+
+	go func() {
+		for msg := range s.msgCH {
+			go s.handleMsg(msg)
+		}
+	}()
+
+	s.consumer.RunConsumer()
 }
